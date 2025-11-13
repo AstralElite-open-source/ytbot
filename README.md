@@ -14,6 +14,10 @@ Just paste a YouTube link to download high quality videos and audio!
 
 ## Quick Setup
 
+```bash
+git clone https://github.com/AstralElite-open-source/ytbot.git
+```
+
 ### 1. Get Telegram Credentials
 
 Visit https://my.telegram.org/auth and login:

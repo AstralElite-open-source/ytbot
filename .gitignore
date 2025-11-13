@@ -1,0 +1,9 @@
+downloads/
+*.mp4
+*.mp3
+*.webm
+__pycache__/
+*.pyc
+venv/
+.env
+telegram-bot-api-data/

@@ -11,6 +11,8 @@ Just paste a YouTube link to download high quality videos and audio!
 - 🎨 Animated sticker during downloads
 - 🧹 Clean chat experience (auto-deletes temporary messages)
 - 👥 Multi-user support
+- 🔴 Redis for persistent session storage
+- 📊 Kafka event streaming for monitoring and analytics
 
 ## Quick Setup
 
@@ -70,6 +72,30 @@ docker-compose down
 Restart the bot:
 ```bash
 docker-compose restart
+```
+
+## Kafka Topics
+
+The bot publishes events to the following Kafka topics:
+
+- `youtube-bot-downloads` - Download events (started, completed)
+- `youtube-bot-uploads` - Upload events (started, completed)
+- `youtube-bot-errors` - Error events
+- `youtube-bot-events` - General events (bot started, video detected, etc.)
+
+### Consuming Kafka Events
+
+To consume events from Kafka:
+
+```bash
+# Connect to Kafka container
+docker exec -it youtube-bot-kafka bash
+
+# Consume from all topics
+kafka-console-consumer --bootstrap-server localhost:9092 --topic youtube-bot-downloads --from-beginning
+kafka-console-consumer --bootstrap-server localhost:9092 --topic youtube-bot-uploads --from-beginning
+kafka-console-consumer --bootstrap-server localhost:9092 --topic youtube-bot-errors --from-beginning
+kafka-console-consumer --bootstrap-server localhost:9092 --topic youtube-bot-events --from-beginning
 ```
 
 ## Customization

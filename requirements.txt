@@ -1,3 +1,5 @@
 python-telegram-bot==21.0
 yt-dlp
 aiohttp
+redis==5.0.1
+kafka-python==2.0.2

@@ -3,12 +3,18 @@ import asyncio
 import math
 import subprocess
 import glob
+import json
+import time
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.request import HTTPXRequest
 import yt_dlp
 import re
 import aiohttp
+import redis
+from kafka import KafkaProducer
+from kafka.errors import KafkaError
 
 # Bot token from environment variable
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -17,6 +23,59 @@ if not BOT_TOKEN:
 
 # Telegram Bot API URL (use local server if available, otherwise standard API)
 TELEGRAM_BOT_API_URL = os.getenv('TELEGRAM_BOT_API_URL', 'https://api.telegram.org')
+
+# Redis configuration
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_DB = int(os.getenv('REDIS_DB', 0))
+
+# Kafka configuration
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092').split(',')
+
+# Initialize Redis client
+try:
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
+    # Test connection
+    redis_client.ping()
+    print(f"✅ Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+except Exception as e:
+    print(f"❌ Failed to connect to Redis: {e}")
+    print("⚠️ Bot will exit. Please ensure Redis is running.")
+    exit(1)
+
+# Initialize Kafka Producer with retry logic
+kafka_producer = None
+max_kafka_retries = 10
+kafka_retry_delay = 3
+
+for attempt in range(max_kafka_retries):
+    try:
+        kafka_producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            acks='all',
+            retries=3,
+            max_in_flight_requests_per_connection=1,
+            api_version_auto_timeout_ms=30000
+        )
+        print(f"✅ Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
+        break
+    except Exception as e:
+        if attempt < max_kafka_retries - 1:
+            print(f"⏳ Kafka not ready (attempt {attempt + 1}/{max_kafka_retries}): {e}")
+            print(f"   Retrying in {kafka_retry_delay} seconds...")
+            time.sleep(kafka_retry_delay)
+        else:
+            print(f"⚠️ Failed to connect to Kafka after {max_kafka_retries} attempts: {e}")
+            print("⚠️ Bot will continue without Kafka support")
+            kafka_producer = None
 
 # Telegram file size limit
 # 50MB for standard API, 2GB for self-hosted local Bot API
@@ -27,11 +86,70 @@ else:
     TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024  # 50 MB (standard API)
     print("⚠️ Using standard Bot API - 50MB file limit")
 
-# Store video info temporarily
-user_data = {}
+# Redis key prefixes
+USER_DATA_PREFIX = "user_data:"
+ACTIVE_DOWNLOADS_PREFIX = "active_downloads:"
 
-# Track active downloads per user (for concurrent support)
-active_downloads = {}
+# Kafka topics
+KAFKA_TOPIC_DOWNLOADS = "youtube-bot-downloads"
+KAFKA_TOPIC_UPLOADS = "youtube-bot-uploads"
+KAFKA_TOPIC_ERRORS = "youtube-bot-errors"
+KAFKA_TOPIC_EVENTS = "youtube-bot-events"
+
+# Helper functions for Kafka operations
+def publish_event(topic, event_type, user_id, data):
+    """Publish event to Kafka topic"""
+    if not kafka_producer:
+        return
+    
+    try:
+        event = {
+            'event_type': event_type,
+            'user_id': user_id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'data': data
+        }
+        future = kafka_producer.send(topic, value=event)
+        # Non-blocking - fire and forget
+        future.add_callback(lambda metadata: None)
+        future.add_errback(lambda e: print(f"Kafka publish error: {e}"))
+    except Exception as e:
+        print(f"Error publishing to Kafka: {e}")
+
+# Helper functions for Redis operations
+def set_user_data(user_id, data, ttl=3600):
+    """Store user data in Redis with TTL (default 1 hour)"""
+    key = f"{USER_DATA_PREFIX}{user_id}"
+    redis_client.setex(key, ttl, json.dumps(data))
+
+def get_user_data(user_id):
+    """Retrieve user data from Redis"""
+    key = f"{USER_DATA_PREFIX}{user_id}"
+    data = redis_client.get(key)
+    return json.loads(data) if data else None
+
+def delete_user_data(user_id):
+    """Delete user data from Redis"""
+    key = f"{USER_DATA_PREFIX}{user_id}"
+    redis_client.delete(key)
+
+def set_active_download(user_id, active=True, ttl=7200):
+    """Mark user as having active download (default 2 hours TTL)"""
+    key = f"{ACTIVE_DOWNLOADS_PREFIX}{user_id}"
+    if active:
+        redis_client.setex(key, ttl, "1")
+    else:
+        redis_client.delete(key)
+
+def is_active_download(user_id):
+    """Check if user has active download"""
+    key = f"{ACTIVE_DOWNLOADS_PREFIX}{user_id}"
+    return redis_client.exists(key) > 0
+
+def delete_active_download(user_id):
+    """Remove active download flag"""
+    key = f"{ACTIVE_DOWNLOADS_PREFIX}{user_id}"
+    redis_client.delete(key)
 
 def is_youtube_url(url):
     """Check if the URL is a valid YouTube URL (including playlists and channels)"""
@@ -104,6 +222,19 @@ def split_file_by_parts(input_path, max_bytes=TELEGRAM_FILE_LIMIT):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
+    user_id = update.message.from_user.id
+    
+    # Publish user start event
+    publish_event(
+        KAFKA_TOPIC_EVENTS,
+        'bot_started',
+        user_id,
+        {
+            'username': update.message.from_user.username,
+            'first_name': update.message.from_user.first_name
+        }
+    )
+    
     await update.message.reply_text(
         "👋 Welcome to YouTube Downloader Bot!\n\n"
         "📺 Simply send me a YouTube link and I'll help you download it.\n\n"
@@ -155,12 +286,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     entries = info.get('entries', [])
                     video_count = len(entries)
                     
-                    user_data[user_id] = {
+                    set_user_data(user_id, {
                         'url': message,
                         'title': info.get('title', 'Unknown'),
                         'is_playlist': True,
                         'video_count': video_count
-                    }
+                    })
+                    
+                    # Publish playlist detected event
+                    publish_event(
+                        KAFKA_TOPIC_EVENTS,
+                        'playlist_detected',
+                        user_id,
+                        {
+                            'title': info.get('title', 'Unknown'),
+                            'video_count': video_count,
+                            'url': message
+                        }
+                    )
                     
                     keyboard = [
                         [InlineKeyboardButton("🎥 Download All (720p)", callback_data='playlist_720p')],
@@ -187,14 +330,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 else:
                     # Handle single video
-                    user_data[user_id] = {
+                    set_user_data(user_id, {
                         'url': message,
                         'title': info.get('title', 'Unknown'),
                         'duration': info.get('duration', 0),
                         'is_playlist': False
-                    }
+                    })
                     
                     duration = info.get('duration', 0)
+                    
+                    # Publish video detected event
+                    publish_event(
+                        KAFKA_TOPIC_EVENTS,
+                        'video_detected',
+                        user_id,
+                        {
+                            'title': info.get('title', 'Unknown'),
+                            'duration': duration,
+                            'url': message
+                        }
+                    )
                 
                 # Get available formats and build quality options dynamically
                 formats = info.get('formats', [])
@@ -250,6 +405,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=reply_markup
                 )
         except Exception as e:
+            # Publish error event
+            publish_event(
+                KAFKA_TOPIC_ERRORS,
+                'video_info_fetch_error',
+                user_id,
+                {
+                    'error': str(e),
+                    'url': message
+                }
+            )
             await update.message.reply_text(f"❌ Error: {str(e)}\n\nPlease make sure the link is valid.")
     else:
         await update.message.reply_text(
@@ -262,15 +427,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     
-    if user_id not in user_data:
+    user_info = get_user_data(user_id)
+    if not user_info:
         await query.answer("Session expired!")
         await query.edit_message_text("❌ Session expired. Please send the link again.")
         return
     
     await query.answer()
     
-    video_url = user_data[user_id]['url']
-    video_title = user_data[user_id]['title']
+    video_url = user_info['url']
+    video_title = user_info['title']
     
     # Determine quality settings
     quality_map = {
@@ -289,18 +455,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not selected_quality:
         if query.data == 'cancel':
             await query.edit_message_text("❌ Download cancelled")
-            if user_id in user_data:
-                del user_data[user_id]
+            delete_user_data(user_id)
             return
         await query.edit_message_text("❌ Invalid selection.")
         return
     
     # Check if it's a playlist download
     is_playlist_download = query.data.startswith('playlist_')
-    video_info = user_data[user_id]
+    video_info = user_info
     
     # Mark user as having active download
-    active_downloads[user_id] = True
+    set_active_download(user_id, True)
+    
+    # Publish download started event
+    publish_event(
+        KAFKA_TOPIC_DOWNLOADS,
+        'download_started',
+        user_id,
+        {
+            'video_title': video_title,
+            'quality': selected_quality['label'],
+            'is_playlist': is_playlist_download,
+            'video_count': video_info.get('video_count') if is_playlist_download else 1
+        }
+    )
     
     # Delete quality selection message for cleaner chat
     try:
@@ -451,11 +629,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          f"❌ Failed: {failed_uploads}"
                 )
                 
+                # Publish playlist download completed event
+                publish_event(
+                    KAFKA_TOPIC_DOWNLOADS,
+                    'playlist_download_completed',
+                    user_id,
+                    {
+                        'total_videos': len(entries),
+                        'successful': successful_uploads,
+                        'failed': failed_uploads,
+                        'quality': selected_quality['label']
+                    }
+                )
+                
                 # Cleanup
-                if user_id in user_data:
-                    del user_data[user_id]
-                if user_id in active_downloads:
-                    del active_downloads[user_id]
+                delete_user_data(user_id)
+                delete_active_download(user_id)
                 
                 return
             
@@ -469,13 +658,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not os.path.exists(filename):
             print(f"ERROR: File not found: {filename}")
             await query.message.reply_text("❌ Error: Downloaded file not found!")
-            if user_id in active_downloads:
-                del active_downloads[user_id]
-            if user_id in user_data:
-                del user_data[user_id]
+            delete_active_download(user_id)
+            delete_user_data(user_id)
             return
         
-        print(f"File exists: {filename}, size: {os.path.getsize(filename)} bytes")
+        file_size = os.path.getsize(filename)
+        print(f"File exists: {filename}, size: {file_size} bytes")
+        
+        # Publish download completed event
+        publish_event(
+            KAFKA_TOPIC_DOWNLOADS,
+            'download_completed',
+            user_id,
+            {
+                'video_title': video_title,
+                'file_size': file_size,
+                'quality': selected_quality['label']
+            }
+        )
         
         # Mark as complete
         # Get file size for upload info
@@ -516,6 +716,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
         
         animation_task = asyncio.create_task(upload_progress())
+        
+        # Publish upload started event
+        publish_event(
+            KAFKA_TOPIC_UPLOADS,
+            'upload_started',
+            user_id,
+            {
+                'video_title': video_title,
+                'file_size': file_size,
+                'quality': selected_quality['label']
+            }
+        )
         
         try:
             # Send the file directly
@@ -567,21 +779,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
+        # Publish upload completed event
+        publish_event(
+            KAFKA_TOPIC_UPLOADS,
+            'upload_completed',
+            user_id,
+            {
+                'video_title': video_title,
+                'file_size': file_size,
+                'quality': selected_quality['label']
+            }
+        )
+        
         # Clear user data and active downloads
-        if user_id in user_data:
-            del user_data[user_id]
-        if user_id in active_downloads:
-            del active_downloads[user_id]
+        delete_user_data(user_id)
+        delete_active_download(user_id)
         
     except Exception as e:
         error_msg = str(e)
         print(f"ERROR in button_callback for user {user_id}: {type(e).__name__}: {error_msg}")
+        
+        # Publish error event
+        publish_event(
+            KAFKA_TOPIC_ERRORS,
+            'download_error',
+            user_id,
+            {
+                'error_type': type(e).__name__,
+                'error_message': error_msg,
+                'video_title': video_title if 'video_title' in locals() else 'Unknown'
+            }
+        )
+        
         await query.message.reply_text(f"❌ Download failed: {error_msg}")
-        # Clear progress on error
-        if user_id in download_progress:
-            del download_progress[user_id]
-        if user_id in user_data:
-            del user_data[user_id]
+        # Clear data on error
+        delete_user_data(user_id)
+        delete_active_download(user_id)
 
 def main():
     """Start the bot"""
@@ -614,7 +847,14 @@ def main():
     # Start the bot
     print("🤖 Bot is running...")
     print(f"📊 File size limit: {format_bytes(TELEGRAM_FILE_LIMIT)}")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        # Close Kafka producer on shutdown
+        if kafka_producer:
+            kafka_producer.close()
+            print("✅ Kafka producer closed")
 
 if __name__ == '__main__':
     main()
